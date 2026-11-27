@@ -76,26 +76,27 @@ class PCEGalerkin:
             sol = root(self.residual, guess, args=(phi,), jac=jac, method="hybr", tol=tol)
         return sol
 
-    def continuation(self, N_max, u0=None, tol=1e-10, return_history=False,
-                     stop_on_fail=False):
-        """Degree continuation from N = 0 to N = N_max."""
+    def continuation(self, N_max, u0=None, tol=1e-10, res_tol=1e-5,
+                     return_history=False, stop_on_fail=False, start_degree=0):
+        """Degree continuation from N = start_degree to N = N_max."""
         phi_all = legendre_basis(self.x_quad, N_max)
         if u0 is None:
-            guess = np.zeros(self.n)
+            guess = np.zeros(self.n * (start_degree + 1))
         else:
             guess = np.asarray(u0, dtype=float).ravel()
 
         history = {}
         c = None
-        for N in range(N_max + 1):
+        for N in range(start_degree, N_max + 1):
             phi = phi_all[: N + 1]
-            if N > 0:
+            if N > start_degree:
                 c_pad = np.zeros((self.n, N + 1))
                 c_pad[:, :N] = c
                 guess = c_pad.ravel()
+            guess[np.abs(guess) < 1e-14] = 0.0
 
             sol = self.solve(guess, phi, tol=tol)
-            if np.linalg.norm(sol.fun, np.inf) > 1e-5:
+            if res_tol is not None and np.linalg.norm(sol.fun, np.inf) > res_tol:
                 if stop_on_fail:
                     break
                 return None
@@ -109,21 +110,19 @@ class PCEGalerkin:
         return c
 
     def find_branches(self, N_max, n_samples=50, seed=42, unique_tol=1e-3,
-                      box=(-2.0, 2.0), initialization=[]):
-        """Run degree continuation from random N = 0 guesses and collect distinct branches."""
+                      box=(-2.0, 2.0), initialization=(), start_degree=0,
+                      res_tol=1e-5):
+        """Run degree continuation from random N = start_degree guesses and collect distinct branches."""
         rng = np.random.default_rng(seed)
         branches = []
-        iterations = n_samples
-        
-        if len(initialization)>0:
-            iterations+=len(initialization)
-            
-        for i in range(iterations):
-            if i<n_samples:
-                u0 = rng.uniform(box[0], box[1], size=self.n)
-            else:
-                u0 = initialization[i-n_samples]
-            c = self.continuation(N_max, u0=u0)
+        guesses = [
+            rng.uniform(box[0], box[1], size=self.n * (start_degree + 1))
+            for _ in range(n_samples)
+        ] + [np.asarray(u0, dtype=float).ravel() for u0 in initialization]
+
+        for u0 in guesses:
+            c = self.continuation(N_max, u0=u0, res_tol=res_tol,
+                                  start_degree=start_degree)
             if c is None:
                 continue
             is_new = True
@@ -133,7 +132,6 @@ class PCEGalerkin:
                     break
             if is_new:
                 branches.append(c)
-                
         return branches
 
     def random_roots(self, N, n_samples=50, seed=42, unique_tol=1e-3, scale=1.0):
@@ -184,68 +182,95 @@ class PCEGalerkin:
         return err_l2, err_linf, res_ls
 
 
-def plot_roots_vs_branches(rhs, jac_u, mu_bounds, exact_curves, N=10,
-                           n_samples=20, seed=2, scale=0.8, unique_tol=1e-6,
-                           box=(-2.0, 2.0)):
-    """Compare direct random root-finding at degree N with degree continuation."""
-    solver = PCEGalerkin(rhs, jac_u, mu_bounds=mu_bounds, state_dim=1,
-                         quad_order=2 * N + 1)
-    all_roots = solver.random_roots(N, n_samples=n_samples, seed=seed, scale=scale)
-    branches = solver.find_branches(N, n_samples=n_samples, seed=seed,
-                                    unique_tol=unique_tol, box=box)
+def plot_2d(solver, branches, exact_curves=(), state_idx=0, branch_style="--",
+            branch_lw=2.5, branch_zorder=5, branch_alpha=1.0, branch_labels=None,
+            colors=None, exact_style="k-", exact_lw=2.5, exact_zorder=1,
+            exact_label=None, ylabel=r"$u$", title=None, xlim=None, ylim=None,
+            ax=None):
+    """Plot 2D (mu, u[state_idx]) exact curves and PCE branches on an axis."""
+    if ax is None:
+        _, ax = plt.subplots()
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharey=True)
+    for idx, (mu_ex, u_ex) in enumerate(exact_curves):
+        u_arr = u_ex[state_idx] if np.ndim(u_ex) == 2 else u_ex
+        ax.plot(mu_ex, u_arr, exact_style, lw=exact_lw, zorder=exact_zorder,
+                label=exact_label if idx == 0 else None)
 
-    for c in all_roots:
+    for idx, c in enumerate(branches):
         mu_g, u_g = solver.eval(c)
-        axes[0].plot(mu_g, u_g[0], alpha=0.5)
-    for mu_ex, u_ex in exact_curves:
-        axes[0].plot(mu_ex, u_ex, "k:", lw=3.0, zorder=5)
-    axes[0].set_title("Random initializations")
-    axes[0].set_xlabel(r"$\mu$")
-    axes[0].set_ylabel(r"$u$")
-    axes[0].grid(True, linestyle="--", alpha=0.4)
+        kw = {"lw": branch_lw, "zorder": branch_zorder, "alpha": branch_alpha}
+        if colors is not None:
+            kw["color"] = colors[idx % len(colors)]
+        if branch_labels is not None:
+            kw["label"] = branch_labels[idx]
+        ax.plot(mu_g, u_g[state_idx], branch_style, **kw)
 
-    for c in branches:
+    ax.set_xlabel(r"$\mu$")
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    if title is not None:
+        ax.set_title(title)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    if exact_label is not None or branch_labels is not None:
+        ax.legend(loc="best", framealpha=0.85)
+    return ax
+
+
+def plot_3d(solver, branches, exact_curves=(), idx_pair=(0, 1),
+            labels=(r"$x$", r"$y$"), branch_style="--", branch_lw=2.5,
+            branch_zorder=5, branch_alpha=1.0, branch_labels=None, colors=None,
+            exact_style="k-", exact_lw=2.5, exact_zorder=1, exact_label=None,
+            zlabel=r"$\mu$", elev=17, azim=-117, title=None, ax=None):
+    """Plot 3D (u_i, u_j, mu) exact curves and PCE branches on an axis."""
+    if ax is None:
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection="3d")
+
+    i, j = idx_pair
+    for idx, (mu_ex, u_ex) in enumerate(exact_curves):
+        ax.plot(u_ex[i], u_ex[j], mu_ex, exact_style, lw=exact_lw,
+                zorder=exact_zorder, label=exact_label if idx == 0 else None)
+
+    for idx, c in enumerate(branches):
         mu_g, u_g = solver.eval(c)
-        axes[1].plot(mu_g, u_g[0])
-    for mu_ex, u_ex in exact_curves:
-        axes[1].plot(mu_ex, u_ex, "k:", lw=3.0, zorder=5)
-    axes[1].set_title("Degree continuation")
-    axes[1].set_xlabel(r"$\mu$")
-    axes[1].grid(True, linestyle="--", alpha=0.4)
+        kw = {"lw": branch_lw, "zorder": branch_zorder, "alpha": branch_alpha}
+        if colors is not None:
+            kw["color"] = colors[idx % len(colors)]
+        if branch_labels is not None:
+            kw["label"] = branch_labels[idx]
+        ax.plot(u_g[i], u_g[j], mu_g, branch_style, **kw)
 
-    plt.tight_layout()
-    plt.show()
+    ax.set_xlabel(labels[0], labelpad=8)
+    ax.set_ylabel(labels[1], labelpad=8)
+    ax.zaxis.set_rotate_label(False)
+    ax.set_zlabel(zlabel, rotation=90, labelpad=10)
+    if np.ptp(ax.get_xlim()) < 0.2:
+        ax.set_xlim(-1.0, 1.0)
+    if np.ptp(ax.get_ylim()) < 0.2:
+        ax.set_ylim(-1.0, 1.0)
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_major_locator(plt.MaxNLocator(2))
+        axis.set_tick_params(pad=2)
+    ax.view_init(elev=elev, azim=azim)
+    if title is not None:
+        ax.set_title(title, y=0.96)
+    if exact_label is not None or branch_labels is not None:
+        ax.legend(loc="upper left", framealpha=0.85)
+    return ax
 
 
-def plot_regime(rhs, jac_u, exact_fn, name, bounds, ref_rates, u0,
-                N_max=30, plot_degrees=None, exact_label=r"Exact $\bar{u}$"):
-    """Plot branch approximations and convergence vs degree N for one interval."""
-    a, b = bounds
-    if plot_degrees is None:
-        plot_degrees = [0, 1, N_max // 2, N_max]
+def plot_convergence(solver, history, exact_fn, ref_rates=(), ax=None):
+    """Plot L^2 error, L^inf error, and Galerkin residual vs degree N."""
+    if ax is None:
+        _, ax = plt.subplots()
 
-    degrees = np.arange(1, N_max + 1)
+    degrees = np.array(sorted(N for N in history if N >= 1))
     anchor_idx = int(0.6 * len(degrees))
     anchor_scale = 1.6
-
-    solver = PCEGalerkin(rhs, jac_u, mu_bounds=bounds, state_dim=1,
-                         quad_order=2 * N_max + 1)
-    history = solver.continuation(N_max, u0=u0, return_history=True)
-
-    fig, (ax_branch, ax_conv) = plt.subplots(1, 2, figsize=(11, 4.5))
-
-    mu_ex = np.linspace(a, b, 600)
-    ax_branch.plot(mu_ex, exact_fn(mu_ex)[0], "k-", lw=3.5, label=exact_label)
-    for N in plot_degrees:
-        mu_g, u_g = solver.eval(history[N])
-        ax_branch.plot(mu_g, u_g[0], "--", lw=3.0, label=rf"$N={N}$")
-    ax_branch.set_title(f"{name}")
-    ax_branch.set_xlabel(r"$\mu$")
-    ax_branch.set_ylabel(r"$u$")
-    ax_branch.grid(True, linestyle="--", alpha=0.4)
-    ax_branch.legend(loc="lower right", framealpha=0.85)
 
     err_l2, err_linf, res_ls = [], [], []
     for N in degrees:
@@ -254,12 +279,12 @@ def plot_regime(rhs, jac_u, exact_fn, name, bounds, ref_rates, u0,
         err_linf.append(einf)
         res_ls.append(r)
 
-    ax_conv.semilogy(degrees, err_l2, "-", color="#065895",
-                     label=r"$\|\bar{u} - u_N\|_{L^2}$")
-    ax_conv.semilogy(degrees, err_linf, "-", color="#77ac30",
-                     label=r"$\|\bar{u} - u_N\|_{L^\infty}$")
-    ax_conv.semilogy(degrees, res_ls, "-", color="#f79a25",
-                     label=r"$\|\mathcal{F}(u_{LS,N})\|_{L^2}$")
+    ax.semilogy(degrees, err_l2, "-", color="#065895",
+                label=r"$\|\bar{u} - u_N\|_{L^2}$")
+    ax.semilogy(degrees, err_linf, "-", color="#77ac30",
+                label=r"$\|\bar{u} - u_N\|_{L^\infty}$")
+    ax.semilogy(degrees, res_ls, "-", color="#f79a25",
+                label=r"$\|\mathcal{F}(u_{LS,N})\|_{L^2}$")
 
     curves = {"l2": err_l2, "linf": err_linf, "res": res_ls}
     for label, style, rate_fn, anchor_key in ref_rates:
@@ -273,13 +298,11 @@ def plot_regime(rhs, jac_u, exact_fn, name, bounds, ref_rates, u0,
         else:
             ref_curve = rate_fn(degrees.astype(float))
         ref_curve *= anchor_scale * target[anchor_idx] / ref_curve[anchor_idx]
-        ax_conv.semilogy(degrees, ref_curve, style, color="k", alpha=0.75, label=label)
+        ax.semilogy(degrees, ref_curve, style, color="k", alpha=0.75, label=label)
 
-    ax_conv.set_title("Convergence")
-    ax_conv.set_xlabel(r"$N$")
-    ax_conv.set_ylabel("Error")
-    ax_conv.grid(True, which="both", linestyle="--", alpha=0.4)
-    ax_conv.legend(loc="lower left", framealpha=0.85)
-
-    plt.tight_layout()
-    plt.show()
+    ax.set_title("Convergence")
+    ax.set_xlabel(r"$N$")
+    ax.set_ylabel("Error")
+    ax.grid(True, which="both", linestyle="--", alpha=0.4)
+    ax.legend(loc="lower left", framealpha=0.85)
+    return ax
